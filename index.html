@@ -1,0 +1,307 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
+    <title>Three.js WebXR Auto-Start AR</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #000; /* Optional: background for non-AR state */
+        }
+        canvas {
+            display: block; /* Prevent extra space below canvas */
+        }
+        #message-overlay {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            padding: 10px;
+            background-color: rgba(0,0,0,0.7);
+            color: white;
+            z-index: 100;
+            border-radius: 5px;
+            font-family: sans-serif;
+            font-size: 14px;
+            display: none; /* Start hidden */
+            max-width: calc(100% - 40px); /* Prevent overflow */
+        }
+    </style>
+
+    <!-- Import Map with Relative Paths -->
+    <script type="importmap">
+    {
+        "imports": {
+            "three": "./libs/three.module.js",
+            "three/addons/": "./libs/"
+        }
+    }
+    </script>
+    <!-- End Import Map -->
+
+</head>
+<body>
+    <!-- Div for displaying status messages -->
+    <div id="message-overlay"></div>
+
+    <!-- Main script -->
+    <script type="module">
+        import * as THREE from 'three'; // Uses relative path from import map
+        // Assuming GLTFLoader.js is directly in /libs/ and exports GLTFLoader
+        import { GLTFLoader } from './libs/GLTFLoader.js'; // Use relative path
+
+        // --- Global variables ---
+        let scene, renderer, controller;
+        let reticle, doorModel; // Model loaded from GLTF
+        let currentSession = null;
+        let xrRefSpace = null; // Store the reference space
+        let xrHitTestSource = null;
+
+        // --- Helper function to display messages ---
+        function showStatusMessage(message) {
+            let messageOverlay = document.getElementById('message-overlay');
+            if (!messageOverlay) {
+                console.error("Message overlay div not found!");
+                return; // Exit if the div isn't found
+            }
+            messageOverlay.textContent = message;
+            messageOverlay.style.display = 'block';
+            console.log(message); // Also log to console
+
+            // Optional: Hide message after a delay
+            // setTimeout(() => { messageOverlay.style.display = 'none'; }, 5000);
+        }
+
+        // --- Initialization (Scene, Renderer, Model Loading) ---
+        function initSceneAndLoadModel() {
+            scene = new THREE.Scene();
+
+            const light = new THREE.HemisphereLight(0xffffff, 0xbbbbff, 1);
+            light.position.set(0.5, 1, 0.25);
+            scene.add(light);
+            const dirLight = new THREE.DirectionalLight(0xffffff, 0.5);
+            dirLight.position.set(1, 1.5, 0.8);
+            scene.add(dirLight);
+
+            // Renderer setup (crucial: create renderer instance here)
+            renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setPixelRatio(window.devicePixelRatio);
+            renderer.xr.enabled = true;
+            document.body.appendChild(renderer.domElement); // Add canvas to body
+
+            // Reticle setup
+            const reticleGeometry = new THREE.RingGeometry(0.05, 0.07, 32).rotateX(-Math.PI / 2);
+            const reticleMaterial = new THREE.MeshBasicMaterial({
+                color: 0x00ff00,
+                opacity: 0.7,
+                transparent: true
+            });
+            reticle = new THREE.Mesh(reticleGeometry, reticleMaterial);
+            reticle.matrixAutoUpdate = false;
+            reticle.visible = false;
+            scene.add(reticle);
+
+            // Controller setup for 'select' event (tap)
+            controller = renderer.xr.getController(0);
+            controller.addEventListener('select', onSelect);
+            scene.add(controller);
+
+            // Load the door model using a relative path
+            const loader = new GLTFLoader();
+            loader.load(
+                './models/door.glb', // Use relative path
+                (gltf) => {
+                    showStatusMessage("Door model loaded successfully.");
+                    doorModel = gltf.scene;
+                    // Optional: Apply initial scaling or adjustments if needed
+                    // doorModel.scale.set(0.1, 0.1, 0.1);
+                },
+                undefined, // Progress callback (optional)
+                (error) => {
+                    console.error('Error loading door model:', error);
+                    showStatusMessage('Error: Failed to load the 3D model.');
+                }
+            );
+
+            window.addEventListener('resize', onWindowResize);
+        }
+
+        // --- WebXR Session Handling ---
+        async function startARAutomatically() {
+            showStatusMessage("Attempting to start AR...");
+
+            if (!navigator.xr) {
+                showStatusMessage("Error: WebXR not supported by this browser.");
+                return;
+            }
+
+            const sessionMode = 'immersive-ar';
+            const sessionInit = { requiredFeatures: ['hit-test'] };
+
+            try {
+                const supported = await navigator.xr.isSessionSupported(sessionMode); // Basic support check
+                 if (!supported) {
+                    showStatusMessage("Error: AR session mode not supported on this device.");
+                    return;
+                }
+                showStatusMessage("AR supported. Requesting session...");
+
+                // --- Attempt to request session automatically ---
+                // NOTE: Might be blocked by browser if no user gesture!
+                const session = await navigator.xr.requestSession(sessionMode, sessionInit);
+                showStatusMessage("AR Session obtained.");
+
+                // --- Session Started Successfully ---
+                currentSession = session;
+
+                // Initialize scene objects and renderer *now*
+                initSceneAndLoadModel();
+
+                // Set up Three.js rendering with the XR session
+                await renderer.xr.setSession(session);
+                showStatusMessage("Renderer XR session configured.");
+
+                // Set up reference spaces and hit testing
+                await setupReferenceSpacesAndHitTest();
+
+                // Add listener for session end
+                session.addEventListener('end', onSessionEnd);
+
+                // Start the render loop
+                renderer.setAnimationLoop(render);
+                // Optionally hide status message after a short delay on success
+                setTimeout(() => {
+                    const msgOverlay = document.getElementById('message-overlay');
+                    if (msgOverlay && msgOverlay.textContent.includes("Hit testing enabled")) {
+                         msgOverlay.style.display = 'none';
+                    }
+                }, 3000);
+
+
+            } catch (error) {
+                console.error("Failed to start AR session automatically:", error);
+                showStatusMessage(`Error starting AR: ${error.message}. User interaction might be needed.`);
+                // Consider adding a fallback button here if needed
+                // e.g., addManualStartButton();
+            }
+        }
+
+        async function setupReferenceSpacesAndHitTest() {
+            if (!currentSession) return;
+
+            try {
+                // Get 'viewer' space for hit-testing
+                const viewerSpace = await currentSession.requestReferenceSpace('viewer');
+
+                // Get 'local' or 'local-floor' for placement reference
+                try {
+                    xrRefSpace = await currentSession.requestReferenceSpace('local');
+                    console.log("Using 'local' reference space.");
+                } catch (localError) {
+                    console.warn(`'local' space failed: ${localError.message}. Trying 'local-floor'.`);
+                    xrRefSpace = await currentSession.requestReferenceSpace('local-floor');
+                    console.log("Using 'local-floor' reference space.");
+                }
+
+                // Start hit-testing
+                xrHitTestSource = await currentSession.requestHitTestSource({ space: viewerSpace });
+                showStatusMessage("Hit testing enabled."); // Update status
+
+            } catch (error) {
+                console.error("Failed to set up reference space or hit test source:", error);
+                showStatusMessage(`Error setting up AR space: ${error.message}`);
+                if (currentSession) {
+                    await currentSession.end().catch(e => console.error("Error ending session:", e)); // End session if setup fails
+                }
+            }
+        }
+
+
+        function onSessionEnd() {
+            showStatusMessage("AR Session Ended");
+            if (xrHitTestSource) {
+                // xrHitTestSource.cancel(); // Check if needed based on WebXR spec version
+                xrHitTestSource = null;
+            }
+            currentSession = null;
+            xrRefSpace = null;
+            if(reticle) reticle.visible = false;
+
+            // Stop render loop
+            if(renderer) renderer.setAnimationLoop(null);
+
+            // Optional: Clean up scene, renderer, listeners if needed
+            // Consider removing the canvas or showing a 'Restart' button
+        }
+
+        // --- Event Handlers ---
+        function onSelect() {
+            if (reticle && reticle.visible && doorModel) {
+                console.log("Placing door model...");
+                const placedDoor = doorModel.clone();
+                placedDoor.matrix.copy(reticle.matrix);
+                placedDoor.matrix.decompose(placedDoor.position, placedDoor.quaternion, placedDoor.scale);
+                placedDoor.visible = true;
+                scene.add(placedDoor);
+            } else {
+                 console.log("Select ignored: Reticle not visible or model not loaded.");
+            }
+        }
+
+        function onWindowResize() {
+            if (renderer && !renderer.xr.isPresenting) {
+                // Only resize if not in XR session
+                renderer.setSize(window.innerWidth, window.innerHeight);
+            }
+        }
+
+        // --- Render Loop ---
+        function render(timestamp, frame) {
+            // Ensure renderer exists before trying to use it
+            if (!renderer) return;
+
+            let cameraToUse = null; // Define camera variable
+
+            if (renderer.xr.isPresenting && frame) {
+                cameraToUse = renderer.xr.getCamera(); // Get XR camera
+
+                // --- Hit Testing ---
+                if (xrHitTestSource && xrRefSpace && reticle) { // Check if all needed objects exist
+                    const hitTestResults = frame.getHitTestResults(xrHitTestSource);
+                    if (hitTestResults.length > 0) {
+                        const hit = hitTestResults[0];
+                        const pose = hit.getPose(xrRefSpace); // Use the stored reference space
+                        if (pose) {
+                            reticle.visible = true;
+                            reticle.matrix.fromArray(pose.transform.matrix);
+                        } else {
+                            reticle.visible = false;
+                        }
+                    } else {
+                        reticle.visible = false;
+                    }
+                } else if (reticle) {
+                    reticle.visible = false;
+                }
+            } else if (reticle) {
+                // Hide reticle if not presenting
+                reticle.visible = false;
+            }
+
+            // Render the scene using the appropriate camera
+            // If not presenting, you would need a default camera setup for anything to show.
+            // For this example, we only render if presenting.
+            if (cameraToUse && scene) { // Check scene exists too
+                 renderer.render(scene, cameraToUse);
+            }
+        }
+
+        // --- Start the process ---
+        // Use DOMContentLoaded to ensure the body exists for message overlay etc.
+        window.addEventListener('DOMContentLoaded', startARAutomatically);
+
+    </script>
+</body>
+</html>
